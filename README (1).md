@@ -153,15 +153,20 @@ docker compose up -d --build
 
 ## Что дальше
 
+Полный порядок сборки — в [корневом README](README.md). Коротко, что осталось:
+
 | Шаг | Что делаем |
 |---|---|
-| 2 | Нода в первой локации, NODE_PORT закрыт на всё кроме IP панели |
-| 3 | Config Profile с VLESS Reality, Host |
-| 4 | Остальные локации + Internal Squads под тарифы |
-| 5 | Страница подписки на `sub`, шаблон под Happ |
-| 5.5 | Белые списки — [whitelist/](whitelist/README.md) (можно делать сразу после шага 5) |
-| 6 | HWID Device Limit — [enable-hwid.sh](enable-hwid.sh), плагины ноды (Torrent Blocker, Egress Filter) |
-| 7 | Telegram-бот с CryptoBot — [bot/](bot/README.md) |
+| 2 | Config Profile с VLESS Reality |
+| 3 | Нода: порт 2222 закрыт на всё, кроме IP панели |
+| 4 | Host — как клиент видит ноду |
+| 5 | Internal Squads под тарифы |
+| 6 | Страница подписки на `sub` |
+| 7 | HWID Device Limit — [enable-hwid.sh](enable-hwid.sh) |
+| 8 | Telegram-бот с CryptoBot — [bot/](bot/README.md) |
+| 9 | Белые списки — [whitelist/](whitelist/README.md) |
+
+Config Profile идёт **до** ноды: панель требует указать профиль и его инбаунды прямо в форме создания ноды, раньше её просто не создать.
 
 ## Файлы после установки
 
