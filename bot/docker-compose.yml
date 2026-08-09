@@ -1,0 +1,30 @@
+services:
+  vpn-bot:
+    build: .
+    image: vpn-bot:latest
+    container_name: vpn-bot
+    hostname: vpn-bot
+    restart: always
+    env_file: .env
+    volumes:
+      - vpn-bot-data:/data
+      # правьте тарифы без пересборки образа
+      - ./tariffs.json:/app/tariffs.json:ro
+    networks:
+      - remnawave-network
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: 3
+
+networks:
+  remnawave-network:
+    name: remnawave-network
+    driver: bridge
+    external: true
+
+volumes:
+  vpn-bot-data:
+    name: vpn-bot-data
+    driver: local

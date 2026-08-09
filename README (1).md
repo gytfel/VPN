@@ -116,6 +116,18 @@ cd whitelist && ./build-whitelist.sh
 
 Готовые шаблоны вставляются в панель (Templates → Subscription Templates). Подробности, проверка и грабли — в [whitelist/README.md](whitelist/README.md).
 
+## Telegram-бот
+
+Продажа доступа через CryptoBot и выдача одноразовых ссылок на подключение — покупатель выбирает устройство (iPhone, Android, Windows, Mac) и получает ссылку, которая открывается один раз и сама настраивает приложение.
+
+```bash
+cp -r bot /opt/remnawave/bot && cd /opt/remnawave/bot
+cp .env.example .env && nano .env
+docker compose up -d --build
+```
+
+Установка, настройка Caddy и вебхука — в [bot/README.md](bot/README.md).
+
 ## Что дальше
 
 | Шаг | Что делаем |
@@ -126,7 +138,7 @@ cd whitelist && ./build-whitelist.sh
 | 5 | Страница подписки на `sub`, шаблон под Happ |
 | 5.5 | Белые списки — [whitelist/](whitelist/README.md) (можно делать сразу после шага 5) |
 | 6 | HWID Device Limit, плагины ноды (Torrent Blocker, Egress Filter) |
-| 7 | Telegram-бот с CryptoBot |
+| 7 | Telegram-бот с CryptoBot — [bot/](bot/README.md) |
 
 ## Файлы после установки
 
