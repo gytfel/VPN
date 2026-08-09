@@ -1,0 +1,6 @@
+[
+  {"id": "m1", "title": "1 месяц",  "days": 30,  "devices": 1, "price": "1.5", "asset": "USDT", "traffic_gb": 0},
+  {"id": "m3", "title": "3 месяца", "days": 90,  "devices": 2, "price": "4",   "asset": "USDT", "traffic_gb": 0},
+  {"id": "m6", "title": "6 месяцев","days": 180, "devices": 3, "price": "7",   "asset": "USDT", "traffic_gb": 0},
+  {"id": "y1", "title": "1 год",    "days": 365, "devices": 5, "price": "12",  "asset": "USDT", "traffic_gb": 0}
+]
