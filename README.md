@@ -224,6 +224,10 @@ Streisand HWID шлют. Проверьте на одном живом поль�
 одноразовую ссылку на настройку выбранного устройства — iPhone, Android,
 Windows или Mac.
 
+Новым пользователям первой кнопкой предлагается **3 дня бесплатно** — по
+кнопке «Получить», не автоматически. Один раз на человека, настраивается
+через `TRIAL_DAYS` и `TRIAL_ENABLED`.
+
 ```bash
 cp -r bot /opt/remnawave/bot && cd /opt/remnawave/bot
 cp .env.example .env

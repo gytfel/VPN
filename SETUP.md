@@ -375,6 +375,10 @@ nano tariffs.json     # свои цены и сроки
 docker compose up -d --build
 ```
 
+Новым пользователям бот первой кнопкой предложит **3 дня бесплатно** — по
+кнопке «Получить», а не автоматически. Срок и лимиты меняются в `.env`
+(`TRIAL_DAYS`, `TRIAL_DEVICES`), выключается через `TRIAL_ENABLED=false`.
+
 Подробности и грабли — в [bot/README.md](bot/README.md).
 
 ---

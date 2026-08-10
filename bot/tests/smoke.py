@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -23,6 +24,9 @@ from app.cryptobot import CryptoBot, invoice_payload, parse_payload  # noqa: E40
 from app.db import Db  # noqa: E402
 from app.web import build_app  # noqa: E402
 
+# Часть проверок намеренно ломает панель — их traceback в выводе не нужен
+logging.disable(logging.CRITICAL)
+
 FAILS: list[str] = []
 
 
@@ -36,7 +40,7 @@ SUB_URL = 'https://sub.example.com/abcdef123456'
 USERNAME = 'tg123456'
 
 
-def make_cfg(db_path: str) -> Config:
+def make_cfg(db_path: str, trial_enabled: bool = True) -> Config:
     return Config(
         bot_token='x', admin_ids=frozenset(),
         remnawave_url='http://remnawave:3000', remnawave_token='t',
@@ -44,6 +48,7 @@ def make_cfg(db_path: str) -> Config:
         public_base='https://sub.example.com', link_path='/get', link_ttl_minutes=30,
         cryptobot_token='cbtoken', cryptobot_api='https://pay.crypt.bot/api',
         db_path=db_path, web_host='127.0.0.1', web_port=0,
+        trial_enabled=trial_enabled, trial_days=3, trial_devices=1, trial_traffic_gb=0,
         tariffs=(Tariff('m1', '1 месяц', 30, 1, '1.5', 'USDT'),),
     )
 
@@ -260,11 +265,143 @@ async def test_remnawave() -> None:
         await server.close()
 
 
+async def test_trial() -> None:
+    """Пробный период: только новым и ровно один раз."""
+    print('\nПробный период')
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Db(os.path.join(tmp, 'b.sqlite3'))
+        await db.init()
+
+        check('новый пользователь триал ещё не брал', not await db.trial_taken(1))
+        check('первый claim проходит', await db.claim_trial(1))
+        check('второй claim не проходит', not await db.claim_trial(1))
+        check('после claim триал помечен взятым', await db.trial_taken(1))
+
+        # два одновременных нажатия кнопки
+        results = await asyncio.gather(db.claim_trial(2), db.claim_trial(2))
+        check('при гонке триал достаётся одному', sum(results) == 1, str(results))
+
+        # если панель не ответила, право вернулось
+        await db.release_trial(2)
+        check('release возвращает право на триал', not await db.trial_taken(2))
+        check('и его можно взять снова', await db.claim_trial(2))
+
+        # доступность кнопки
+        from app import handlers
+        cfg = make_cfg(db.path)
+        handlers.setup(cfg, db, None, None)
+
+        check('триал доступен незнакомцу', await handlers.trial_available(999))
+        check('недоступен тому, кто уже брал', not await handlers.trial_available(1))
+
+        await db.save_user(500, 'u-500', 'tg500', SUB_URL)
+        check('недоступен тому, у кого есть подписка',
+              not await handlers.trial_available(500))
+
+        off = make_cfg(db.path, trial_enabled=False)
+        handlers.setup(off, db, None, None)
+        check('недоступен при TRIAL_ENABLED=false', not await handlers.trial_available(999))
+        handlers.setup(cfg, db, None, None)
+
+        # кнопка в меню
+        kb = await handlers.menu_for(999)
+        texts = [b.text for row in kb.inline_keyboard for b in row]
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        check('кнопка «Получить» есть у новичка',
+              any('Получить' in t for t in texts), str(texts))
+        check('она первая в меню', 'Получить' in texts[0], str(texts))
+        check('её callback — trial', datas[0] == 'trial', str(datas))
+        check('в кнопке указан срок', '3 дня' in texts[0], texts[0])
+
+        kb = await handlers.menu_for(1)
+        texts = [b.text for row in kb.inline_keyboard for b in row]
+        check('у бравшего триал кнопки нет',
+              not any('Получить' in t for t in texts), str(texts))
+
+        check('пробный тариф — 3 дня', cfg.trial.days == 3)
+        check('пробный тариф бесплатный', cfg.trial.price == '0')
+
+
+async def test_trial_grant() -> None:
+    """Выдача триала целиком: панель, сохранение, сообщение с выбором устройства."""
+    print('\nВыдача пробного периода')
+    from aiohttp import web as aweb
+
+    from app import handlers
+    from app.remnawave import Remnawave
+
+    async def create(request):
+        body = await request.json()
+        return aweb.json_response({'response': {
+            'uuid': 'u-trial', 'username': body['username'], 'shortUuid': 's1',
+            'subscriptionUrl': SUB_URL, 'expireAt': body['expireAt'],
+            'hwidDeviceLimit': body.get('hwidDeviceLimit'), 'status': 'ACTIVE'}})
+
+    async def not_found(request):
+        return aweb.json_response({'message': 'not found'}, status=404)
+
+    app = aweb.Application()
+    app.router.add_get('/api/users/by-username/{name}', not_found)
+    app.router.add_post('/api/users', create)
+    server = TestServer(app)
+    await server.start_server()
+
+    class FakeBot:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, chat_id, text, **kw):
+            self.sent.append((chat_id, text, kw))
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Db(os.path.join(tmp, 'b.sqlite3'))
+            await db.init()
+            cfg = make_cfg(db.path)
+            panel = Remnawave(str(server.make_url('')).rstrip('/'), 'token')
+            handlers.setup(cfg, db, panel, None)
+
+            bot = FakeBot()
+            ok = await handlers.grant(bot, 777, cfg.trial, '🎁 Пробный период активирован')
+            check('выдача прошла', ok)
+
+            saved = await db.get_user(777)
+            check('пользователь сохранён локально', saved and saved['sub_url'] == SUB_URL)
+
+            _, text, kw = bot.sent[0]
+            check('в сообщении сказано про пробный период',
+                  'Пробный период активирован' in text, text[:60])
+            check('предложен выбор устройства', 'выберите устройство' in text.lower())
+            kb = kw['reply_markup']
+            datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+            check('клавиатура — четыре устройства',
+                  sum(1 for d in datas if d and d.startswith('dev:')) == 4, str(datas))
+
+            # после выдачи триал больше не предлагается
+            await db.claim_trial(777)
+            check('кнопка «Получить» пропала', not await handlers.trial_available(777))
+
+            # панель недоступна — право на триал возвращается
+            dead = Remnawave('http://127.0.0.1:9', 'token')
+            handlers.setup(cfg, db, dead, None)
+            bot2 = FakeBot()
+            await db.claim_trial(888)
+            ok = await handlers.grant(bot2, 888, cfg.trial, '🎁 Пробный период активирован')
+            check('при отказе панели выдача возвращает False', not ok)
+            check('человеку сказали про поддержку',
+                  'поддержку' in bot2.sent[0][1], bot2.sent[0][1][:60])
+            await db.release_trial(888)
+            check('право на триал вернулось', await handlers.trial_available(888))
+    finally:
+        await server.close()
+
+
 async def test_imports() -> None:
     print('\nСборка модулей')
     from app import handlers
     check('хендлеры импортируются', handlers.router is not None)
-    check('меню строится', len(handlers.main_menu().inline_keyboard) == 3)
+    check('меню без триала — 3 кнопки', len(handlers.main_menu().inline_keyboard) == 3)
+    check('меню с триалом — 4 кнопки', len(handlers.main_menu(True).inline_keyboard) == 4)
 
 
 async def main() -> None:
@@ -273,6 +410,8 @@ async def main() -> None:
     await test_web()
     await test_payment_guard()
     await test_remnawave()
+    await test_trial()
+    await test_trial_grant()
     await test_imports()
     print()
     if FAILS:

@@ -53,7 +53,21 @@ class Config:
     web_host: str
     web_port: int
 
+    trial_enabled: bool
+    trial_days: int
+    trial_devices: int
+    trial_traffic_gb: int
+
     tariffs: tuple[Tariff, ...]
+
+    @property
+    def trial(self) -> Tariff:
+        """Пробный период как обычный тариф — чтобы выдавать его тем же кодом."""
+        return Tariff(
+            id='trial', title=f'Пробные {self.trial_days} дня',
+            days=self.trial_days, devices=self.trial_devices,
+            price='0', asset='', traffic_gb=self.trial_traffic_gb,
+        )
 
     def tariff(self, tariff_id: str) -> Tariff | None:
         return next((t for t in self.tariffs if t.id == tariff_id), None)
@@ -89,5 +103,9 @@ def load(tariffs_file: str | None = None) -> Config:
         db_path=os.getenv('DB_PATH', 'data/bot.sqlite3'),
         web_host=os.getenv('WEB_HOST', '0.0.0.0'),
         web_port=_int('WEB_PORT', 8080),
+        trial_enabled=os.getenv('TRIAL_ENABLED', 'true').lower() == 'true',
+        trial_days=_int('TRIAL_DAYS', 3),
+        trial_devices=_int('TRIAL_DEVICES', 1),
+        trial_traffic_gb=_int('TRIAL_TRAFFIC_GB', 0),
         tariffs=tariffs,
     )

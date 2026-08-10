@@ -30,6 +30,14 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS payments_tg_idx ON payments(tg_id);
 
+-- Пробный период. Отдельная таблица, а не флаг в users: запись должна
+-- пережить и истечение подписки, и удаление пользователя из панели,
+-- иначе триал можно будет брать снова и снова.
+CREATE TABLE IF NOT EXISTS trials (
+    tg_id       INTEGER PRIMARY KEY,
+    taken_at    INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS links (
     token       TEXT    PRIMARY KEY,
     tg_id       INTEGER NOT NULL,
@@ -121,6 +129,32 @@ class Db:
             )
             await conn.commit()
             return cur.rowcount > 0
+
+    # ── Пробный период ───────────────────────────────────────
+    async def claim_trial(self, tg_id: int) -> bool:
+        """Занимает пробный период. False — значит уже брали.
+
+        INSERT в таблицу с PRIMARY KEY атомарен, поэтому два быстрых нажатия
+        подряд не выдадут триал дважды.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                'INSERT OR IGNORE INTO trials (tg_id, taken_at) VALUES (?, ?)',
+                (tg_id, int(time.time())),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def release_trial(self, tg_id: int) -> None:
+        """Возвращает право на триал, если выдать его так и не удалось."""
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute('DELETE FROM trials WHERE tg_id = ?', (tg_id,))
+            await conn.commit()
+
+    async def trial_taken(self, tg_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute('SELECT 1 FROM trials WHERE tg_id = ?', (tg_id,))
+            return await cur.fetchone() is not None
 
     # ── Одноразовые ссылки ───────────────────────────────────
     async def create_link(self, tg_id: int, platform: str, sub_url: str,

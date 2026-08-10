@@ -33,12 +33,31 @@ def setup(config: Config, database: Db, remnawave: Remnawave, cryptobot: CryptoB
 
 # ── Клавиатуры ────────────────────────────────────────────────
 
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def main_menu(with_trial: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if with_trial:
+        # Первой кнопкой и заметно: человек сам решает, брать ли пробный период
+        rows.append([InlineKeyboardButton(
+            text=f'🎁 Получить {cfg.trial_days} дня бесплатно', callback_data='trial')])
+    rows += [
         [InlineKeyboardButton(text='💳 Купить доступ', callback_data='buy')],
         [InlineKeyboardButton(text='📱 Подключить устройство', callback_data='devices')],
         [InlineKeyboardButton(text='ℹ️ Моя подписка', callback_data='status')],
-    ])
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def trial_available(tg_id: int) -> bool:
+    """Пробный период положен только новым: без подписки и без прошлого триала."""
+    if not cfg.trial_enabled:
+        return False
+    if await db.trial_taken(tg_id):
+        return False
+    return await db.get_user(tg_id) is None
+
+
+async def menu_for(tg_id: int) -> InlineKeyboardMarkup:
+    return main_menu(await trial_available(tg_id))
 
 
 def tariffs_kb() -> InlineKeyboardMarkup:
@@ -71,12 +90,14 @@ def devices_kb() -> InlineKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    await message.answer(
-        'Привет! Здесь можно оплатить VPN и подключить к нему устройства.\n\n'
-        'После оплаты вы выбираете устройство — iPhone, Android, Windows или Mac — '
-        'и получаете одноразовую ссылку, которая сама настроит приложение.',
-        reply_markup=main_menu(),
-    )
+    tg_id = message.from_user.id
+    text = ('Привет! Здесь можно оплатить VPN и подключить к нему устройства.\n\n'
+            'Вы выбираете устройство — iPhone, Android, Windows или Mac — '
+            'и получаете одноразовую ссылку, которая сама настроит приложение.')
+    if await trial_available(tg_id):
+        text += (f'\n\nЕсть <b>{cfg.trial_days} дня бесплатно</b>, чтобы попробовать. '
+                 'Карта и оплата не нужны — жмите «Получить», если интересно.')
+    await message.answer(text, reply_markup=await menu_for(tg_id))
 
 
 @router.message(Command('devices'))
@@ -87,14 +108,15 @@ async def cmd_devices(message: Message) -> None:
 @router.message(Command('status'))
 async def cmd_status(message: Message) -> None:
     await message.answer(await _status_text(message.from_user.id),
-                         reply_markup=main_menu(), link_preview_options=NO_PREVIEW)
+                         reply_markup=await menu_for(message.from_user.id),
+                         link_preview_options=NO_PREVIEW)
 
 
 # ── Меню ──────────────────────────────────────────────────────
 
 @router.callback_query(F.data == 'menu')
 async def cb_menu(call: CallbackQuery) -> None:
-    await call.message.edit_text('Чем помочь?', reply_markup=main_menu())
+    await call.message.edit_text('Чем помочь?', reply_markup=await menu_for(call.from_user.id))
     await call.answer()
 
 
@@ -107,7 +129,7 @@ async def cb_buy(call: CallbackQuery) -> None:
 @router.callback_query(F.data == 'status')
 async def cb_status(call: CallbackQuery) -> None:
     await call.message.edit_text(await _status_text(call.from_user.id),
-                                 reply_markup=main_menu(),
+                                 reply_markup=await menu_for(call.from_user.id),
                                  link_preview_options=NO_PREVIEW)
     await call.answer()
 
@@ -191,25 +213,61 @@ async def apply_payment(bot: Bot, tg_id: int, tariff_id: str, invoice_id: str) -
         log.info('Счёт %s уже начислен, пропускаю', invoice_id)
         return
 
+    await grant(bot, tg_id, tariff, '✅ Оплата получена')
+
+
+async def grant(bot: Bot, tg_id: int, tariff: Tariff, header: str) -> bool:
+    """Заводит доступ в панели и зовёт выбрать устройство.
+
+    Общий путь для оплаты и для пробного периода — чтобы они не разъезжались.
+    """
     try:
         user = await panel.provision(tg_id, tariff.days, tariff.devices, tariff.traffic_bytes)
     except Exception:
         log.exception('Не смог создать пользователя в панели для %s', tg_id)
         await bot.send_message(
             tg_id,
-            'Оплата прошла, но панель не ответила. Напишите в поддержку — '
-            'доступ выдадим руками, платить второй раз не нужно.')
-        return
+            'Панель не ответила. Напишите в поддержку — доступ выдадим руками.')
+        return False
 
     await db.save_user(tg_id, user['uuid'], user['username'], user['subscriptionUrl'])
     await bot.send_message(
         tg_id,
-        f'✅ Оплата получена, доступ активен до '
-        f'<b>{_fmt_date(user.get("expireAt"))}</b>.\n'
-        f'Устройств по тарифу: {tariff.devices}.\n\n'
+        f'{header}, доступ активен до <b>{_fmt_date(user.get("expireAt"))}</b>.\n'
+        f'Устройств: {tariff.devices}.\n\n'
         'Теперь выберите устройство, которое настраиваем:',
         reply_markup=devices_kb(),
     )
+    return True
+
+
+# ── Пробный период ────────────────────────────────────────────
+
+@router.callback_query(F.data == 'trial')
+async def cb_trial(call: CallbackQuery) -> None:
+    tg_id = call.from_user.id
+
+    if not cfg.trial_enabled:
+        await call.answer('Пробный период сейчас не выдаётся', show_alert=True)
+        return
+
+    if await db.get_user(tg_id) is not None:
+        await call.answer('У вас уже есть подписка — пробный период не нужен',
+                          show_alert=True)
+        return
+
+    # Занимаем право на триал ДО обращения к панели: два быстрых нажатия
+    # не должны выдать два периода.
+    if not await db.claim_trial(tg_id):
+        await call.answer('Пробный период вы уже брали', show_alert=True)
+        return
+
+    await call.answer()
+    await call.message.edit_text(f'Выдаю {cfg.trial_days} дня…')
+
+    if not await grant(call.bot, tg_id, cfg.trial, '🎁 Пробный период активирован'):
+        # Панель не ответила — возвращаем право попробовать ещё раз
+        await db.release_trial(tg_id)
 
 
 # ── Выбор устройства и одноразовая ссылка ─────────────────────
@@ -223,7 +281,7 @@ async def cb_devices(call: CallbackQuery) -> None:
 async def _ask_device(send, tg_id: int) -> None:
     user = await db.get_user(tg_id)
     if not user:
-        await send('Сначала нужно оплатить доступ.', reply_markup=main_menu())
+        await send('Сначала нужно получить доступ.', reply_markup=await menu_for(tg_id))
         return
     await send('Какое устройство настраиваем?', reply_markup=devices_kb())
 
@@ -264,6 +322,9 @@ async def cb_device(call: CallbackQuery) -> None:
 async def _status_text(tg_id: int) -> str:
     local = await db.get_user(tg_id)
     if not local:
+        if await trial_available(tg_id):
+            return (f'Подписки пока нет.\n\nМожно взять <b>{cfg.trial_days} дня '
+                    'бесплатно</b> — кнопка «Получить» ниже.')
         return 'Подписки пока нет. Нажмите «Купить доступ».'
     try:
         user = await panel.find_by_username(local['username'])
