@@ -2,7 +2,7 @@
 #
 # Сборка шаблонов подписки Remnawave для работы по белому списку.
 #
-# На выходе — четыре готовых файла, которые вставляются в панель
+# На выходе — готовые файлы, которые вставляются в панель
 # (Templates → Subscription Templates). Через туннель пойдут только домены
 # из domains.txt, остальной трафик — напрямую, мимо VPN.
 #
@@ -19,6 +19,7 @@ GROUP="→ Remnawave"
 DOH="https://1.1.1.1/dns-query"
 BASE_LIST="domains.txt"
 SINGBOX_LEGACY=0
+BLOCK_QUIC=1
 EXTRA_FILES=()
 EXTRA_URLS=()
 
@@ -40,6 +41,9 @@ usage() {
                     формат DNS для sing-box до 1.12 (старые сборки Hiddify и т.п.).
                     По умолчанию генерируется формат 1.12+, потому что в 1.14
                     старый выпилен совсем.
+      --keep-quic   не резать QUIC в TUN-конфиге. По умолчанию QUIC к доменам
+                    из списка режется, чтобы браузер откатился на TCP и
+                    маршрутизация по домену срабатывала всегда.
   -h, --help        эта справка
 
 Пример:
@@ -55,6 +59,7 @@ while [[ $# -gt 0 ]]; do
         -g|--group) GROUP="$2"; shift 2 ;;
         --dns)      DOH="$2"; shift 2 ;;
         --singbox-legacy) SINGBOX_LEGACY=1; shift ;;
+        --keep-quic)      BLOCK_QUIC=0; shift ;;
         -h|--help)  usage; exit 0 ;;
         *)          die "Неизвестная опция: $1 (--help)" ;;
     esac
@@ -83,11 +88,12 @@ done
 mkdir -p "$OUT_DIR"
 
 # ── Генерация ─────────────────────────────────────────────────
-python3 - "$RAW" "$OUT_DIR" "$GROUP" "$DOH" "$SINGBOX_LEGACY" <<'PYEOF'
+python3 - "$RAW" "$OUT_DIR" "$GROUP" "$DOH" "$SINGBOX_LEGACY" "$BLOCK_QUIC" <<'PYEOF'
 import json, os, re, sys
 
 raw_path, out_dir, group, doh = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 singbox_legacy = sys.argv[5] == '1'
+block_quic = sys.argv[6] == '1'
 
 # ── Нормализация списка ───────────────────────────────────────
 domains = []
@@ -128,53 +134,108 @@ if not doh_is_ip:
     singbox_exact.append(doh_host)
     singbox_suffix.append(f'.{doh_host}')
 
-# ── XRAY_JSON ─────────────────────────────────────────────────
-# Порядок правил важен: последнее правило — «всё остальное напрямую».
-# Без него трафик уходил бы в outbound proxy, который панель ставит первым.
-xray_rules = [
-    {'type': 'field', 'protocol': ['bittorrent'], 'outboundTag': 'direct'},
-]
-if doh_is_ip:
-    xray_rules.append({'type': 'field', 'ip': [f'{doh_host}/32'], 'outboundTag': 'proxy'})
-xray_rules += [
-    {'type': 'field', 'domain': xray_domains, 'outboundTag': 'proxy'},
-    {'type': 'field', 'network': 'tcp,udp', 'outboundTag': 'direct'},
-]
+# ── XRAY_JSON: два режима ─────────────────────────────────────
+# Happ (и остальные клиенты на Xray) отдают этот JSON ядру как есть — свои
+# настройки маршрутизации приложение к нему не применяет. Значит режим
+# целиком определяется тем, что мы здесь напишем.
+#
+#   tun   — весь системный трафик заходит в туннель. Домены восстанавливаются
+#           сниффингом, DNS обслуживает сам конфиг.
+#   proxy — приложение слушает socks/http, система ходит через них. Имя хоста
+#           клиент передаёт сам, DNS остаётся системным.
 
-xray = {
-    'dns': {
-        'servers': [
-            {'address': doh, 'domains': xray_domains, 'skipFallback': True},
-            'localhost',
-        ],
-        'queryStrategy': 'UseIP',
-    },
-    'routing': {
-        # AsIs — маршрутизация по имени домена. Имя уезжает на сервер, и он его
-        # резолвит сам: подмена DNS у провайдера на белый список не влияет.
-        'domainStrategy': 'AsIs',
-        'domainMatcher': 'hybrid',
-        'rules': xray_rules,
-    },
-    'inbounds': [
+def xray_inbounds():
+    """Инбаунды одинаковые: в режиме TUN приложение заводит системный туннель
+    и подаёт трафик в этот же socks."""
+    sniff = {'enabled': True, 'routeOnly': False,
+             'destOverride': ['http', 'tls', 'quic']}
+    return [
         {
             'tag': 'socks', 'port': 10808, 'listen': '127.0.0.1', 'protocol': 'socks',
             'settings': {'udp': True, 'auth': 'noauth'},
-            'sniffing': {'enabled': True, 'routeOnly': False,
-                         'destOverride': ['http', 'tls', 'quic']},
+            'sniffing': dict(sniff),
         },
         {
             'tag': 'http', 'port': 10809, 'listen': '127.0.0.1', 'protocol': 'http',
             'settings': {'allowTransparent': False},
-            'sniffing': {'enabled': True, 'routeOnly': False,
-                         'destOverride': ['http', 'tls', 'quic']},
+            'sniffing': dict(sniff),
         },
-    ],
-    'outbounds': [
-        {'tag': 'direct', 'protocol': 'freedom'},
-        {'tag': 'block', 'protocol': 'blackhole'},
-    ],
-}
+    ]
+
+
+def xray_config(mode: str) -> dict:
+    # Порядок правил важен: последнее — «всё остальное напрямую». Без него
+    # трафик уходил бы в outbound proxy, который панель ставит первым.
+    rules = [{'type': 'field', 'protocol': ['bittorrent'], 'outboundTag': 'direct'}]
+
+    if mode == 'tun':
+        if block_quic:
+            # QUIC к доменам из списка режем, чтобы браузер откатился на TLS
+            # поверх TCP. Так маршрутизация по домену срабатывает всегда, а не
+            # зависит от того, вытащил ли сниффер SNI из UDP-пакета.
+            rules.append({'type': 'field', 'network': 'udp', 'port': '443',
+                          'domain': xray_domains, 'outboundTag': 'block'})
+        if doh_is_ip:
+            # DoH-резолвер гоним в туннель, иначе провайдер подменит ответы
+            rules.append({'type': 'field', 'ip': [f'{doh_host}/32'],
+                          'outboundTag': 'proxy'})
+
+    rules += [
+        {'type': 'field', 'domain': xray_domains, 'outboundTag': 'proxy'},
+        {'type': 'field', 'network': 'tcp,udp', 'outboundTag': 'direct'},
+    ]
+
+    if mode == 'tun':
+        dns = {
+            'servers': [
+                {'address': doh, 'domains': xray_domains, 'skipFallback': True},
+                'localhost',
+            ],
+            'queryStrategy': 'UseIP',
+        }
+    else:
+        # В proxy-режиме DNS системе не перехватывается: браузер отдаёт имя
+        # хоста прямо в socks/http, а резолвит его уже сервер на том конце.
+        dns = {'servers': ['localhost'], 'queryStrategy': 'UseIP'}
+
+    return {
+        'dns': dns,
+        'routing': {
+            # AsIs — маршрутизация по имени домена. Имя уезжает на сервер, и он
+            # его резолвит сам: подмена DNS у провайдера на список не влияет.
+            'domainStrategy': 'AsIs',
+            'domainMatcher': 'hybrid',
+            'rules': rules,
+        },
+        'inbounds': xray_inbounds(),
+        'outbounds': [
+            {'tag': 'direct', 'protocol': 'freedom'},
+            {'tag': 'block', 'protocol': 'blackhole'},
+        ],
+    }
+
+def check_xray(cfg: dict, mode: str) -> None:
+    """Инварианты, на которых держится белый список. Ошибка здесь означает
+    молча сломанный конфиг у всех пользователей, поэтому падаем сразу."""
+    rules = cfg['routing']['rules']
+
+    last = rules[-1]
+    if last.get('outboundTag') != 'direct' or 'domain' in last:
+        sys.exit(f'{mode}: последним правилом должен быть catch-all в direct, '
+                 f'иначе всё уедет в туннель. Получилось: {last}')
+
+    proxy_at = [i for i, r in enumerate(rules)
+                if r.get('outboundTag') == 'proxy' and 'domain' in r]
+    if len(proxy_at) != 1:
+        sys.exit(f'{mode}: ожидалось ровно одно доменное правило в proxy')
+
+    quic_at = [i for i, r in enumerate(rules) if r.get('outboundTag') == 'block']
+    if quic_at and quic_at[0] > proxy_at[0]:
+        sys.exit(f'{mode}: правило про QUIC стоит после доменного и не сработает')
+
+    if mode == 'proxy' and quic_at:
+        sys.exit('proxy: резать QUIC тут нечего — UDP через системный прокси не идёт')
+
 
 # ── SINGBOX ───────────────────────────────────────────────────
 # В 1.12 у sing-box сменился формат DNS-серверов и tun-инбаунда, а в 1.14
@@ -341,8 +402,13 @@ def clash_yaml(group_name):
     return ''.join(out)
 
 # ── Запись ────────────────────────────────────────────────────
+xray_tun, xray_proxy = xray_config('tun'), xray_config('proxy')
+check_xray(xray_tun, 'tun')
+check_xray(xray_proxy, 'proxy')
+
 files = {
-    'xray-json.json': json.dumps(xray, ensure_ascii=False, indent=2) + '\n',
+    'xray-json-tun.json':   json.dumps(xray_tun, ensure_ascii=False, indent=2) + '\n',
+    'xray-json-proxy.json': json.dumps(xray_proxy, ensure_ascii=False, indent=2) + '\n',
     'singbox.json':   json.dumps(singbox, ensure_ascii=False, indent=2) + '\n',
     'mihomo.yaml':    clash_yaml(group),
     'clash.yaml':     clash_yaml(group),
@@ -370,10 +436,15 @@ cat <<EOF
   1. Панель → Templates → Subscription Templates
   2. Для каждого типа вставьте содержимое своего файла:
 
-       XRAY_JSON  ←  ${OUT_DIR}/xray-json.json
+       XRAY_JSON  ←  ${OUT_DIR}/xray-json-tun.json     (обычный VPN, весь трафик)
+                  ←  ${OUT_DIR}/xray-json-proxy.json   (только socks/http, без VPN)
        SINGBOX    ←  ${OUT_DIR}/singbox.json
        MIHOMO     ←  ${OUT_DIR}/mihomo.yaml
        CLASH      ←  ${OUT_DIR}/clash.yaml
+
+  Для XRAY_JSON вставляйте ОДИН из двух: tun — если нужен обычный VPN,
+  proxy — если система должна ходить через локальный прокси, а Happ не
+  поднимал системный туннель.
 
   3. Сохраните и обновите подписку в клиенте (не просто переподключитесь —
      именно обновите, иначе клиент возьмёт старый конфиг из кеша).

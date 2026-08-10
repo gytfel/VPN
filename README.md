@@ -282,7 +282,17 @@ cd whitelist && ./build-whitelist.sh
 ```
 
 Готовые шаблоны из `whitelist/out/` вставляются в панель → **Templates** →
-**Subscription Templates**. Подробности — в
+**Subscription Templates**.
+
+Для `XRAY_JSON` (Happ, v2rayNG, Streisand) генерируются два варианта:
+
+| Файл | Режим |
+|---|---|
+| `xray-json-tun.json` | системный VPN-туннель — обычный вариант |
+| `xray-json-proxy.json` | локальный socks/http без системного VPN |
+
+Happ отдаёт JSON ядру как есть и своих правил не применяет, поэтому режим
+задаётся шаблоном, а не галочкой в приложении. Подробности — в
 [whitelist/README.md](whitelist/README.md).
 
 ## 11. Бэкапы
